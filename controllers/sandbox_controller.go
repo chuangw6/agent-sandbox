@@ -837,6 +837,19 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 		return reconcileExistingPod(pod)
 	}
 
+	// Prototyping: Attempt to resume by adopting an active Pod from the warm pool
+	if sandbox.Annotations != nil {
+		if resumeWarmPoolName := sandbox.Annotations["agents.x-k8s.io/resume-warm-pool-name"]; resumeWarmPoolName != "" {
+			adoptedPod, err := r.prototypeAdoptWarmPod(ctx, sandbox, nameHash, resumeWarmPoolName)
+			if err == nil && adoptedPod != nil {
+				return reconcileExistingPod(adoptedPod)
+			}
+			if err != nil {
+				logger.Error(err, "Failed to warm-resume sandbox from pool, falling back to cold start", "pool", resumeWarmPoolName)
+			}
+		}
+	}
+
 	// Create new Pod
 	logger.Info("Creating a new Pod", "Pod.Namespace", sandbox.Namespace, "Pod.Name", sandbox.Name)
 	podLabels := make(map[string]string, len(sandbox.Spec.PodTemplate.ObjectMeta.Labels)+1)
@@ -1271,6 +1284,72 @@ func setSandboxExpiredCondition(sandbox *sandboxv1beta1.Sandbox) {
 func sandboxMarkedExpired(sandbox *sandboxv1beta1.Sandbox) bool {
 	cond := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady))
 	return cond != nil && (cond.Reason == sandboxv1beta1.SandboxReasonExpired)
+}
+
+// prototypeAdoptWarmPod attempts to find a standby Sandbox and adopt its running Pod.
+func (r *SandboxReconciler) prototypeAdoptWarmPod(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, nameHash string, poolName string) (*corev1.Pod, error) {
+	logger := log.FromContext(ctx)
+	poolNameHash := NameHash(poolName)
+
+	// 1. List all standby Sandboxes in the namespace that belong to the target warm pool
+	sbList := &sandboxv1beta1.SandboxList{}
+	if err := r.List(ctx, sbList, client.InNamespace(sandbox.Namespace), client.MatchingLabels{
+		sandboxv1beta1.SandboxWarmPoolLabel: poolNameHash,
+	}); err != nil {
+		return nil, err
+	}
+
+	var candidateSandbox *sandboxv1beta1.Sandbox
+	for _, sb := range sbList.Items {
+		// Only consider sandboxes that are ready and tracking a running Pod name
+		if _, ok := sb.Annotations[sandboxv1beta1.SandboxPodNameAnnotation]; ok {
+			candidateSandbox = &sb
+			break
+		}
+	}
+
+	if candidateSandbox == nil {
+		return nil, fmt.Errorf("no ready warm pool sandboxes available in pool %q", poolName)
+	}
+
+	podName := candidateSandbox.Annotations[sandboxv1beta1.SandboxPodNameAnnotation]
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: sandbox.Namespace, Name: podName}, pod); err != nil {
+		return nil, fmt.Errorf("failed to fetch pod %q: %w", podName, err)
+	}
+
+	// 2. Patch the Pod: Clear old owners, set ownerRef to the resuming Sandbox, and update tracking labels
+	podPatch := client.MergeFrom(pod.DeepCopy())
+	pod.OwnerReferences = nil
+	if err := ctrl.SetControllerReference(sandbox, pod, r.Scheme); err != nil {
+		return nil, fmt.Errorf("failed to set new controller reference on pod: %w", err)
+	}
+	// Re-route DNS and service targeting to the resuming Sandbox
+	pod.Labels[sandboxLabel] = nameHash
+	delete(pod.Labels, sandboxv1beta1.SandboxWarmPoolLabel)
+
+	if err := r.Patch(ctx, pod, podPatch); err != nil {
+		return nil, fmt.Errorf("failed to patch pod metadata for adoption: %w", err)
+	}
+
+	// 3. Track the adopted pod name in the resuming Sandbox's annotation
+	sandboxPatch := client.MergeFrom(sandbox.DeepCopy())
+	if sandbox.Annotations == nil {
+		sandbox.Annotations = make(map[string]string)
+	}
+	sandbox.Annotations[sandboxv1beta1.SandboxPodNameAnnotation] = podName
+	if err := r.Patch(ctx, sandbox, sandboxPatch); err != nil {
+		return nil, fmt.Errorf("failed to update sandbox pod annotation: %w", err)
+	}
+
+	// 4. Delete the standby Sandbox CR so the WarmPool controller replenishes the pool
+	// We orphan the Pod during deletion because it is now owned by the resuming Sandbox.
+	if err := r.Delete(ctx, candidateSandbox); err != nil {
+		logger.Error(err, "Failed to clean up standby sandbox CR", "sandbox", candidateSandbox.Name)
+	}
+
+	logger.Info("Successfully adopted warm pod from warm pool", "sandbox", sandbox.Name, "adoptedPod", pod.Name)
+	return pod, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

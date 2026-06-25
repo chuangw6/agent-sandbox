@@ -237,9 +237,7 @@ func (cl *ClusterClient) PollUntilObjectMatches(obj client.Object, p ...predicat
 
 	timeout := DefaultTimeout
 	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline); remaining < timeout {
-			timeout = remaining
-		}
+		timeout = time.Until(deadline)
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -278,9 +276,7 @@ func (cl *ClusterClient) WaitForObject(ctx context.Context, obj client.Object, p
 
 	timeout := DefaultTimeout
 	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline); remaining < timeout {
-			timeout = remaining
-		}
+		timeout = time.Until(deadline)
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -489,11 +485,14 @@ func (cl *ClusterClient) WaitForObjectNotFound(ctx context.Context, obj client.O
 	cl.Helper()
 	// Static 1 minute timeout, this can be adjusted if needed
 	timeout := DefaultTimeout
-	// Namespaces can take a while to clean up due to cascading deletion of resources.
 	if _, isNamespace := obj.(*corev1.Namespace); isNamespace {
 		timeout = 3 * time.Minute
 	}
-
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > timeout {
+			timeout = remaining
+		}
+	}
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 
 	defer cancel()

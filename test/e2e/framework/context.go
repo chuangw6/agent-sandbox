@@ -124,8 +124,8 @@ func NewTestContext(t T) *TestContext {
 	if err != nil {
 		t.Fatal(err)
 	}
-	restConfig.QPS = 50
-	restConfig.Burst = 100
+	restConfig.QPS = 500
+	restConfig.Burst = 1000
 	th.restConfig = restConfig
 
 	httpClient, err := rest.HTTPClientFor(restConfig)

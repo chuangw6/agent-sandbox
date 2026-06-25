@@ -36,6 +36,7 @@ def create_kind_config(kubelet_verbosity, containerd_loglevel=None):
                 enable-admission-plugins: "NodeRestriction,OwnerReferencesPermissionEnforcement"
           - |
             kind: KubeletConfiguration
+            maxPods: 300
             logging:
               verbosity: {kubelet_verbosity}
         """)

@@ -265,6 +265,7 @@ func (rw *ResourceWatch) watchLoop(ctx context.Context) {
 		}
 
 		// Process events
+	eventLoop:
 		for {
 			select {
 			case <-ctx.Done():
@@ -274,13 +275,13 @@ func (rw *ResourceWatch) watchLoop(ctx context.Context) {
 			case event, ok := <-watcher.ResultChan():
 				if !ok {
 					// Watch channel closed, restart with last resourceVersion
-					break
+					break eventLoop
 				}
 
 				if event.Type == watch.Error {
 					// On error, restart from scratch
 					resourceVersion = ""
-					break
+					break eventLoop
 				}
 
 				// Broadcast to matching subscriptions

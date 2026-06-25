@@ -3291,3 +3291,119 @@ func TestSandboxReconcile_ConditionsDoNotAccumulate(t *testing.T) {
 	require.Len(t, got.Status.Conditions, 1,
 		"conditions slice must not grow across %d reconcile iterations — controller must upsert not append", iters)
 }
+
+func TestReconcilePodWarmResume(t *testing.T) {
+	sandboxName := "my-sandbox"
+	sandboxNs := "my-ns"
+	poolName := "standard-pool"
+	poolNameHash := NameHash(poolName)
+	sandboxUID := types.UID("sandbox-uid")
+	nameHash := NameHash(sandboxName)
+
+	// Resuming Sandbox object
+	sandboxObj := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: sandboxNs,
+			UID:       sandboxUID,
+			Annotations: map[string]string{
+				"agents.x-k8s.io/resume-warm-pool-name": poolName,
+			},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "agent"}},
+				},
+			},
+		},
+	}
+
+	// Standby Sandbox in the warm pool
+	standbySandboxName := "standard-pool-xyz78"
+	standbySandboxUID := types.UID("standby-uid")
+	standbyPodName := "standard-pool-xyz78-pod"
+	standbySandboxObj := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      standbySandboxName,
+			Namespace: sandboxNs,
+			UID:       standbySandboxUID,
+			Labels: map[string]string{
+				sandboxv1beta1.SandboxWarmPoolLabel: poolNameHash,
+			},
+			Annotations: map[string]string{
+				sandboxv1beta1.SandboxPodNameAnnotation: standbyPodName,
+			},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+			PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "agent"}},
+				},
+			},
+		},
+	}
+
+	// Standby Pod owned by the standby Sandbox
+	standbyPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      standbyPodName,
+			Namespace: sandboxNs,
+			Labels: map[string]string{
+				sandboxv1beta1.SandboxWarmPoolLabel: poolNameHash,
+				sandboxLabel:                        NameHash(standbySandboxName),
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: sandboxv1beta1.GroupVersion.String(),
+					Kind:       "Sandbox",
+					Name:       standbySandboxName,
+					UID:        standbySandboxUID,
+					Controller: ptr.To(true),
+				},
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "agent"}},
+		},
+	}
+
+	r := SandboxReconciler{
+		Client:        newFakeClient(sandboxObj, standbySandboxObj, standbyPod),
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	pod, err := r.reconcilePod(t.Context(), sandboxObj, nameHash)
+	require.NoError(t, err)
+	require.NotNil(t, pod)
+	require.Equal(t, standbyPodName, pod.Name)
+
+	// Verify that the adopted Pod's owner reference is updated to point to the resuming Sandbox
+	livePod := &corev1.Pod{}
+	err = r.Get(t.Context(), types.NamespacedName{Name: standbyPodName, Namespace: sandboxNs}, livePod)
+	require.NoError(t, err)
+	require.Len(t, livePod.OwnerReferences, 1)
+	require.Equal(t, string(sandboxUID), string(livePod.OwnerReferences[0].UID))
+	require.Equal(t, sandboxName, livePod.OwnerReferences[0].Name)
+
+	// Verify Pod labels are updated: sandboxLabel is set to nameHash, and warm pool label is removed
+	require.Equal(t, nameHash, livePod.Labels[sandboxLabel])
+	_, warmPoolLabelExists := livePod.Labels[sandboxv1beta1.SandboxWarmPoolLabel]
+	require.False(t, warmPoolLabelExists)
+
+	// Verify Sandbox annotation is updated to track the adopted pod name
+	liveSandbox := &sandboxv1beta1.Sandbox{}
+	err = r.Get(t.Context(), types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}, liveSandbox)
+	require.NoError(t, err)
+	require.Equal(t, standbyPodName, liveSandbox.Annotations[sandboxv1beta1.SandboxPodNameAnnotation])
+
+	// Verify standby Sandbox is deleted
+	liveStandbySandbox := &sandboxv1beta1.Sandbox{}
+	err = r.Get(t.Context(), types.NamespacedName{Name: standbySandboxName, Namespace: sandboxNs}, liveStandbySandbox)
+	require.True(t, k8serrors.IsNotFound(err), "standby sandbox CR should be deleted")
+}
+
